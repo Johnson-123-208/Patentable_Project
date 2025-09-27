@@ -1,0 +1,423 @@
+# Docker Compose for Patentable Project Discovery Backend
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: patent_discovery_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=sqlite:///./projects.db
+      - LOG_LEVEL=info
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:8080
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - sqlite_data:/app/sqlite_data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - patent_network
+
+  # Optional: Add a reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    container_name: patent_discovery_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - patent_network
+    profiles:
+      - production
+
+volumes:
+  sqlite_data:
+    driver: local
+
+networks:
+  patent_network:
+    driver: bridge
+
+
+
+version: '3.8'
+
+services:
+  # Backend API Service
+  backend:
+    build: 
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: patent_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://patent_user:patent_pass@postgres:5432/patent_db
+      - REDIS_URL=redis://redis:6379/0
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - SECRET_KEY=your-secret-key-change-in-production
+      - LOG_LEVEL=INFO
+      - MODEL_CACHE_DIR=/app/models
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - SIMILARITY_THRESHOLD=0.3
+    volumes:
+      - ./app:/app/app
+      - ./utils:/app/utils
+      - ./data:/app/data
+      - ./models:/app/models
+      - backend_logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - patent_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Frontend Streamlit Service
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: patent_frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+    volumes:
+      - ./app:/app/app
+      - ./utils:/app/utils
+      - ./data:/app/data
+      - frontend_logs:/app/logs
+    depends_on:
+      - backend
+    networks:
+      - patent_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: patent_postgres
+    environment:
+      POSTGRES_DB: patent_db
+      POSTGRES_USER: patent_user
+      POSTGRES_PASSWORD: patent_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+      - postgres_logs:/var/log/postgresql
+    networks:
+      - patent_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U patent_user -d patent_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: patent_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - patent_network
+    restart: unless-stopped
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Vector Database (ChromaDB)
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: patent_chromadb
+    ports:
+      - "8001:8000"
+    environment:
+      - CHROMA_SERVER_AUTHN_CREDENTIALS=test-token
+      - CHROMA_SERVER_AUTHN_PROVIDER=chromadb.auth.token.TokenAuthenticationServerProvider
+    volumes:
+      - chromadb_data:/chroma/chroma
+    networks:
+      - patent_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Reverse Proxy (Optional)
+  nginx:
+    image: nginx:alpine
+    container_name: patent_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf
+      - ./config/ssl:/etc/nginx/ssl
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - patent_network
+    restart: unless-stopped
+    profiles:
+      - production
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: patent_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - patent_network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: patent_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - patent_network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # ElasticSearch for Logging (Optional)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: patent_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - patent_network
+    restart: unless-stopped
+    profiles:
+      - logging
+
+  # Kibana Dashboard
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: patent_kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - patent_network
+    restart: unless-stopped
+    profiles:
+      - logging
+
+  # ML Model Server (Optional - for heavy ML workloads)
+  ml_server:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    container_name: patent_ml_server
+    ports:
+      - "8002:8002"
+    environment:
+      - ML_SERVER_PORT=8002
+      - MODEL_CACHE_SIZE=10GB
+      - GPU_ENABLED=false
+    volumes:
+      - ./models:/app/models
+      - ml_models_cache:/app/cache
+    networks:
+      - patent_network
+    restart: unless-stopped
+    profiles:
+      - ml_server
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+# Named Volumes
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  chromadb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  ml_models_cache:
+    driver: local
+  backend_logs:
+    driver: local
+  frontend_logs:
+    driver: local
+  postgres_logs:
+    driver: local
+  nginx_logs:
+    driver: local
+
+# Networks
+networks:
+  patent_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Development Override
+# Use: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+---
+# docker-compose.dev.yml
+version: '3.8'
+
+services:
+  backend:
+    build:
+      target: development
+    volumes:
+      - ./app:/app/app:cached
+      - ./tests:/app/tests:cached
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=DEBUG
+    command: uvicorn app.backend.main:app --reload --host 0.0.0.0 --port 8000
+
+  frontend:
+    build:
+      target: development
+    volumes:
+      - ./app:/app/app:cached
+    environment:
+      - STREAMLIT_LOGGER_LEVEL=DEBUG
+    command: streamlit run app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+
+---
+# docker-compose.prod.yml
+version: '3.8'
+
+services:
+  backend:
+    build:
+      target: production
+    environment:
+      - DEBUG=false
+      - LOG_LEVEL=WARNING
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+
+  frontend:
+    build:
+      target: production
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD_PROD}
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+# Production secrets (use Docker Swarm secrets)
+secrets:
+  postgres_password:
+    external: true
+  api_secret_key:
+    external: true
